@@ -81,9 +81,10 @@ input,select{font:inherit;color:inherit}
 .page img{display:block;width:100%;height:100%;user-select:none;-webkit-user-select:none;-webkit-user-drag:none;pointer-events:none}
 .overlay{position:absolute;inset:0;-webkit-user-select:none;user-select:none}
 .mbox{position:absolute;border-radius:3px;pointer-events:none;transition:background .1s}
-.mbox.cur{background:rgba(255,176,32,.20)}
-.mbox.start{box-shadow:inset 0 0 0 2px var(--green);background:rgba(61,220,151,.10)}
-.mbox.start.cur{background:rgba(255,176,32,.20)}
+.mbox.cur{background:rgba(255,176,32,.08);box-shadow:inset 0 0 0 1px rgba(255,176,32,.28)}
+.mbox.start{box-shadow:inset 0 0 0 1px rgba(61,220,151,.5);background:rgba(61,220,151,.035)}
+.mbox.start.cur{background:rgba(255,176,32,.08)}
+.startmark{display:none}
 .cursor{position:absolute;width:3px;margin-left:-1.5px;background:var(--cursor);border-radius:2px;pointer-events:none;display:none;
   box-shadow:0 0 0 1px rgba(255,255,255,.6),0 0 10px rgba(255,59,48,.75);z-index:5}
 /* edit mode */
@@ -1209,6 +1210,7 @@ function renderOverlays() {
     });
   }
   if (cursorEl.parentNode) cursorEl.remove();
+  placeStartMark();
   if (Engine.playing && state.curMeasure >= 0) { const m = state.measures[state.curMeasure]; if (m) state.pageEls[m.page].ov.appendChild(cursorEl); }
   const ol = $('#orderLine');
   if (ol) {
@@ -1226,9 +1228,17 @@ function setStartPos(pos) {
   state.startPos = clamp(pos, 0, Math.max(0, state.order.length - 1));
   state.startMeasure = state.order.length ? state.order[state.startPos] : 0;
   if (state.mEls[state.startMeasure] && !state.editMode) state.mEls[state.startMeasure].classList.add('start');
-  updatePos();
+  placeStartMark(); updatePos();
 }
 function setStart(mi) { setStartPos(posOf(mi)); }
+const startEl = el('div', 'startmark');
+function placeStartMark() {
+  const m = state.measures[state.startMeasure];
+  if (!m || Engine.playing || state.editMode) { startEl.remove(); return; }
+  const p = state.pageEls[m.page]; if (!p) return;
+  if (startEl.parentNode !== p.ov) p.ov.appendChild(startEl);
+  Object.assign(startEl.style, { left: (m.x0 * 100) + '%', top: (m.y0 * 100) + '%', height: ((m.y1 - m.y0) * 100) + '%' });
+}
 // 카운트인 박 수 (0 = 끔, 4, 8). 예전 데이터(countIn: true/false)도 호환
 function countOf(sc) { return sc.countBeats != null ? sc.countBeats : (sc.countIn === false ? 0 : 4); }
 const COUNT_OPTS = [0, 4, 8];
@@ -1414,8 +1424,9 @@ const SilentAudio = {
     let bin = ''; for (let i = 0; i < buf.length; i++) bin += String.fromCharCode(buf[i]);
     return 'data:audio/wav;base64,' + btoa(bin);
   },
+  // 메트로놈 앱과 같은 방식: 무음 오디오를 반복 재생해서 무음 스위치를 켜도 소리가 나게.
+  // 한 번 켜면 계속 둠(껐다 켰다 하면 iPad에서 Web Audio가 끊길 수 있음)
   unlock() {
-    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
     try {
       if (!this.el) {
         const a = document.createElement('audio');
@@ -1423,7 +1434,7 @@ const SilentAudio = {
         a.setAttribute('playsinline', ''); a.setAttribute('webkit-playsinline', '');
         a.style.display = 'none'; document.body.appendChild(a); this.el = a;
       }
-      const p = this.el.play(); if (p && p.catch) p.catch(() => {});
+      if (this.el.paused) { const p = this.el.play(); if (p && p.catch) p.catch(() => {}); }
     } catch (e) {}
   },
   pause() { try { this.el && this.el.pause(); } catch (e) {} }
@@ -1433,77 +1444,94 @@ const SilentAudio = {
   SilentAudio.unlock(); ['touchend', 'pointerup', 'click'].forEach(e2 => document.removeEventListener(e2, once, true));
 }, true));
 
+const wallNow = () => performance.now() / 1000;
 const Engine = {
-  ctx: null, out: null, playing: false, starting: false, timer: 0, raf: 0, wake: null, lastUsed: 0, fresh: false,
+  ctx: null, out: null, playing: false, timer: 0, raf: 0, wake: null, lastUsed: 0, fresh: false,
+  mode: 'audio',            // 'audio' = 오디오 시계 기준, 'wall' = 오디오가 멈췄을 때 기기 시계로 진행
   makeCtx() {
     const AC = window.AudioContext || window.webkitAudioContext;
-    this.ctx = new AC({ latencyHint: 'interactive' });
+    try { this.ctx = new AC({ latencyHint: 'interactive' }); } catch (e) { this.ctx = new AC(); }
     this.out = this.ctx.createGain(); this.out.connect(this.ctx.destination);
     this.fresh = true;
   },
-  // iOS에서 오래 방치된 오디오가 먹통이 되는 문제 대비: 상태 점검 후 필요하면 새로 만들고, resume 완료를 기다림
-  async ensure() {
+  /** 반드시 탭 이벤트 안에서 '동기로' 호출 — iOS는 터치 순간에만 오디오를 깨워줌 */
+  wake() {
     const stale = this.ctx && Date.now() - this.lastUsed > 10 * 60 * 1000;
     if (this.ctx && (stale || this.ctx.state === 'closed')) { try { this.ctx.close(); } catch (e) {} this.ctx = null; }
     if (!this.ctx) this.makeCtx();
-    if (this.ctx.state !== 'running') { try { await withTimeout(this.ctx.resume(), 1500); } catch (e) {} }
-    if (this.ctx.state !== 'running') {
-      try { this.ctx.close(); } catch (e) {}
-      this.makeCtx();
-      try { await withTimeout(this.ctx.resume(), 1500); } catch (e) {}
-    }
-    // 짧은 무음 버퍼로 출력 깨우기
+    try { const r = this.ctx.resume(); if (r && r.catch) r.catch(() => {}); } catch (e) {}
     try { const b = this.ctx.createBuffer(1, 1, 22050), s = this.ctx.createBufferSource(); s.buffer = b; s.connect(this.out); s.start(0); } catch (e) {}
     this.lastUsed = Date.now();
   },
-  // 메트로놈 앱 기본 클릭 소리: 사인파, 강박 1200Hz / 약박 900Hz, 0.08초 지수 감쇠
   click(t, accent) {
+    // 메트로놈 앱 기본 클릭 소리: 사인파, 강박 1200Hz / 약박 900Hz, 0.08초 지수 감쇠
     const c = this.ctx, o = c.createOscillator(), g = c.createGain();
     o.type = 'sine'; o.frequency.value = accent ? 1200 : 900;
     const v = Math.max(0.001, prefs.vol * (accent ? 1 : 0.6));
     g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
     o.connect(g); g.connect(this.out); o.start(t); o.stop(t + 0.1);
   },
+  now() { return this.mode === 'audio' ? this.ctx.currentTime : wallNow(); },
   beatTime(b) { return this.anchorTime + (b - this.anchorBeat) * this.spb; },
   posAt(t) { return this.anchorBeat + (t - this.anchorTime) / this.spb; },
-  async start(from) {
+  start(from) {
     const sc = state.score; if (!sc || !state.measures.length) { toast('재생할 마디가 없어요. ✏️ 편집에서 마디를 만들어 주세요'); return; }
-    if (this.starting || this.playing) return;
-    this.starting = true; this.abortStart = false;
+    if (this.playing) return;
     SilentAudio.unlock();
-    try { await this.ensure(); } finally { this.starting = false; }
-    if (state.score !== sc || this.abortStart) { this.abortStart = false; return; }
+    this.wake();                                    // 탭 순간에 오디오 깨우기 (기다리지 않음)
     this.B = sc.beats; this.from = from; this.count = countOf(sc);
     this.total = this.count + (state.order.length - from) * this.B;
-    this.spb = 60 / sc.bpm; this.anchorBeat = 0; this.anchorTime = this.ctx.currentTime + (this.fresh ? 0.3 : 0.15); this.next = 0; this.fresh = false;
+    this.spb = 60 / sc.bpm; this.anchorBeat = 0; this.next = 0;
+    const lead = this.fresh ? 0.35 : 0.2; this.fresh = false;
+    this.mode = 'audio'; this.anchorTime = this.ctx.currentTime + lead;
+    this.lastCtxT = this.ctx.currentTime; this.lastCtxWall = wallNow(); this.audioWarned = false;
     this.playing = true; this.lastCount = null;
-    state.curMeasure = -1; state.curPos = from;
+    state.curMeasure = -1; state.curPos = from; startEl.remove();
     this.timer = setInterval(() => this.schedule(), 25); this.schedule();
     cancelAnimationFrame(this.raf); this.raf = requestAnimationFrame(() => this.frame());
     $('#playBtn').classList.add('playing'); $('#playIco').innerHTML = '<path d="M6 4h4v16H6zM14 4h4v16h-4z"/>';
     sc.lastPlayedAt = Date.now(); saveScore(500);
-    try { navigator.wakeLock && navigator.wakeLock.request('screen').then(w => this.wake = w).catch(() => {}); } catch (e) {}
+    try { navigator.wakeLock && navigator.wakeLock.request('screen').then(w => this.wake_ = w).catch(() => {}); } catch (e) {}
+  },
+  /** 오디오 시계가 흐르는지 감시 → 멈췄으면 기기 시계로 전환, 다시 흐르면 오디오로 복귀 */
+  watchdog() {
+    const c = this.ctx, t = c.currentTime, w = wallNow();
+    const advancing = t !== this.lastCtxT;
+    if (advancing) { this.lastCtxT = t; this.lastCtxWall = w; }
+    if (this.mode === 'audio' && !advancing && w - this.lastCtxWall > 0.4) {
+      const pos = this.posAt(t);
+      this.mode = 'wall'; this.anchorBeat = pos; this.anchorTime = w;
+      try { const r = c.resume(); if (r && r.catch) r.catch(() => {}); } catch (e) {}
+      if (!this.audioWarned) { this.audioWarned = true; toast('소리 장치가 아직 안 켜졌어요 — 화면을 한 번 탭해 주세요 (진행선은 계속 갑니다)', 3500); }
+    } else if (this.mode === 'wall' && advancing && c.state === 'running') {
+      const pos = this.posAt(w);
+      this.mode = 'audio'; this.anchorBeat = pos; this.anchorTime = t + 0.05;
+      this.next = Math.max(this.next, Math.ceil(pos + 0.05));
+      toast('소리가 켜졌어요', 1200);
+    }
   },
   schedule() {
-    const ahead = this.ctx.currentTime + 0.15;
+    if (!this.playing) return;
+    this.watchdog();
+    if (this.mode !== 'audio') { this.next = Math.max(this.next, Math.ceil(this.posAt(wallNow()))); return; }
+    const ct = this.ctx.currentTime, ahead = ct + 0.15;
     while (this.next < this.total) {
       const t = this.beatTime(this.next); if (t > ahead) break;
       const inCount = this.next < this.count;
       const bi = inCount ? this.next % this.B : (this.next - this.count) % this.B;
-      if (t >= this.ctx.currentTime - 0.01 && (inCount || prefs.metroOn)) this.click(t, bi === 0);
+      if (t >= ct - 0.01 && (inCount || prefs.metroOn)) this.click(t, bi === 0);
       this.next++;
     }
   },
   setBpm(bpm) {
     if (!this.playing) return;
-    const now = this.ctx.currentTime, pos = this.posAt(now);
+    const now = this.now(), pos = this.posAt(now);
     this.anchorBeat = pos; this.anchorTime = now; this.spb = 60 / bpm;
-    // 이미 예약된(곧 울릴) 박은 그대로 두고 다음 박부터 새 템포
   },
   frame() {
     if (!this.playing) return;
-    const lat = (this.ctx.outputLatency || 0);
-    const pos = this.posAt(this.ctx.currentTime - lat);
+    const t = this.mode === 'audio' ? this.ctx.currentTime - (this.ctx.outputLatency || 0) : wallNow();
+    const pos = this.posAt(t);
     if (pos >= this.total) { this.finish(); return; }
     const ci = $('#countin');
     if (pos < this.count) {
@@ -1523,21 +1551,26 @@ const Engine = {
   finish() { const f = this.from; this.stop(true); setStartPos(f); toast('끝까지 연주했어요 👏', 1500); },
   stop(keepStart, restarting) {
     if (!restarting) exitImmersive();
-    if (this.starting) this.abortStart = true;
     if (!this.playing) return;
     this.playing = false; clearInterval(this.timer); cancelAnimationFrame(this.raf);
     $('#countin').classList.remove('on');
     $('#playBtn').classList.remove('playing'); $('#playIco').innerHTML = '<path d="M7 4.5v15l13-7.5z"/>';
     if (state.mEls[state.curMeasure]) state.mEls[state.curMeasure].classList.remove('cur');
     if (!keepStart && state.curMeasure >= 0 && this.lastCount === 0) setStartPos(state.curPos);
-    state.curMeasure = -1; cursorEl.style.display = 'none';
-    try { this.wake && this.wake.release(); } catch (e) {} this.wake = null;
-    this.lastUsed = Date.now(); SilentAudio.pause();
+    state.curMeasure = -1; cursorEl.style.display = 'none'; placeStartMark();
+    try { this.wake_ && this.wake_.release(); } catch (e) {} this.wake_ = null;
+    this.lastUsed = Date.now();
     // 남은 예약음 끊기
     try { this.out.disconnect(); this.out = this.ctx.createGain(); this.out.connect(this.ctx.destination); } catch (e) {}
     updatePos();
   }
 };
+// 재생 중 아무 곳이나 탭하면 멈춘 오디오를 다시 깨움 (iOS는 터치 순간에만 허용)
+document.addEventListener('pointerdown', () => {
+  if (Engine.playing && Engine.ctx && Engine.mode === 'wall') { SilentAudio.unlock(); try { Engine.ctx.resume(); } catch (e) {} }
+}, true);
+// 백그라운드에 갔다 오면 무음 루프 정리
+document.addEventListener('visibilitychange', () => { if (document.hidden && !Engine.playing) SilentAudio.pause(); });
 function showCursor(mi, frac, beat, pre) {
   const m = state.measures[mi]; if (!m) return;
   const p = state.pageEls[m.page]; if (!p) return;
@@ -1571,7 +1604,7 @@ function followX(m, x) {
 /* ---------- 컨트롤 ---------- */
 $('#playBtn').onclick = () => {
   if (state.editMode) setEditMode(false);
-  if (Engine.playing || Engine.starting) { Engine.stop(); return; }
+  if (Engine.playing) { Engine.stop(); return; }
   if (!state.measures.length) { Engine.start(state.startPos); return; }
   enterImmersive();   // 반드시 탭 이벤트 안에서 바로 호출해야 전체화면이 허용됨
   Engine.start(state.startPos);
